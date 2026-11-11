@@ -3,6 +3,8 @@ module github.com/GoogleCloudPlatform/cloud-sql-proxy/v2
 go 1.26.0
 
 require (
+	cloud.google.com/go/auth v0.24.4
+	cloud.google.com/go/auth/oauth2adapt v0.3.1
 	cloud.google.com/go/cloudsqlconn v1.26.0
 	contrib.go.opencensus.io/exporter/prometheus v0.4.2
 	contrib.go.opencensus.io/exporter/stackdriver v0.13.15-0.20230702191903-2de6d2748484
@@ -25,8 +27,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.24.4 // indirect
-	cloud.google.com/go/auth/oauth2adapt v0.3.1 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	cloud.google.com/go/monitoring v1.32.1 // indirect
 	cloud.google.com/go/sql v0.7.0 // indirect

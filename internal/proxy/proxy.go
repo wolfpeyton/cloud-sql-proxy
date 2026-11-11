@@ -27,12 +27,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/auth"
+	"cloud.google.com/go/auth/credentials"
+	"cloud.google.com/go/auth/credentials/impersonate"
+	"cloud.google.com/go/auth/oauth2adapt"
 	"cloud.google.com/go/cloudsqlconn"
 	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/cloudsql"
 	"github.com/GoogleCloudPlatform/cloud-sql-proxy/v2/internal/gcloud"
 	"golang.org/x/oauth2"
-	"google.golang.org/api/impersonate"
-	"google.golang.org/api/option"
 	"google.golang.org/api/sqladmin/v1"
 )
 
@@ -380,34 +382,12 @@ func (c *Config) iamAuthNEnabled() bool {
 }
 
 func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
-	// If service account impersonation is configured, set up an impersonated
-	// credentials token source.
+	// If service account impersonation is configured, set up impersonated
+	// credentials.
 	if c.ImpersonationChain != "" {
-		var iopts []option.ClientOption
-		if c.UniverseDomain != "" {
-			iopts = append(iopts, option.WithUniverseDomain(c.UniverseDomain))
-		}
-		switch {
-		case c.Token != "":
-			l.Infof("Impersonating service account with OAuth2 token")
-			iopts = append(iopts, option.WithTokenSource(
-				oauth2.StaticTokenSource(&oauth2.Token{AccessToken: c.Token}),
-			))
-		case c.CredentialsFile != "":
-			l.Infof("Impersonating service account with the credentials file at %q", c.CredentialsFile)
-			iopts = append(iopts, option.WithAuthCredentialsFile(option.ServiceAccount, c.CredentialsFile))
-		case c.CredentialsJSON != "":
-			l.Infof("Impersonating service account with JSON credentials environment variable")
-			iopts = append(iopts, option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(c.CredentialsJSON)))
-		case c.GcloudAuth:
-			l.Infof("Impersonating service account with gcloud user credentials")
-			ts, err := gcloud.TokenSource()
-			if err != nil {
-				return nil, err
-			}
-			iopts = append(iopts, option.WithTokenSource(ts))
-		default:
-			l.Infof("Impersonating service account with Application Default Credentials")
+		base, err := impersonationBaseCredentials(c, l)
+		if err != nil {
+			return nil, err
 		}
 		target, delegates := parseImpersonationChain(c.ImpersonationChain)
 		scopes := []string{sqladmin.SqlserviceAdminScope}
@@ -417,35 +397,35 @@ func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 			// otherwise every export is rejected for insufficient scopes.
 			scopes = append(scopes, monitoringWriteScope)
 		}
-		ts, err := impersonate.CredentialsTokenSource(
-			context.Background(),
-			impersonate.CredentialsConfig{
-				TargetPrincipal: target,
-				Delegates:       delegates,
-				Scopes:          scopes,
-			},
-			iopts...,
-		)
+		// The impersonate package sends the token request to the IAM
+		// Credentials endpoint of the base credentials' universe domain.
+		// Setting UniverseDomain here also checks that the base credentials
+		// belong to the configured universe.
+		creds, err := impersonate.NewCredentials(&impersonate.CredentialsOptions{
+			TargetPrincipal: target,
+			Delegates:       delegates,
+			Scopes:          scopes,
+			Credentials:     base,
+			UniverseDomain:  c.UniverseDomain,
+		})
 		if err != nil {
 			return nil, err
 		}
 
 		if c.iamAuthNEnabled() {
-			iamLoginTS, err := impersonate.CredentialsTokenSource(
-				context.Background(),
-				impersonate.CredentialsConfig{
-					TargetPrincipal: target,
-					Delegates:       delegates,
-					Scopes:          []string{iamLoginScope},
-				},
-				iopts...,
-			)
+			iamLoginCreds, err := impersonate.NewCredentials(&impersonate.CredentialsOptions{
+				TargetPrincipal: target,
+				Delegates:       delegates,
+				Scopes:          []string{iamLoginScope},
+				Credentials:     base,
+				UniverseDomain:  c.UniverseDomain,
+			})
 			if err != nil {
 				return nil, err
 			}
-			return cloudsqlconn.WithIAMAuthNTokenSources(ts, iamLoginTS), nil
+			return cloudsqlconn.WithIAMAuthNCredentials(creds, iamLoginCreds), nil
 		}
-		return cloudsqlconn.WithTokenSource(ts), nil
+		return cloudsqlconn.WithCredentials(creds), nil
 	}
 
 	// Otherwise, configure credentials as usual.
@@ -479,6 +459,59 @@ func credentialsOpt(c Config, l cloudsql.Logger) (cloudsqlconn.Option, error) {
 		opt = cloudsqlconn.WithOptions()
 	}
 	return opt, nil
+}
+
+// cloudPlatformScope is the scope requested for the base credentials used to
+// call the IAM Credentials API during service account impersonation.
+const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+
+// impersonationBaseCredentials returns the credentials used to impersonate the
+// target service account. Their universe domain determines which IAM
+// Credentials endpoint receives the impersonation request, so it is set to
+// the configured universe domain.
+func impersonationBaseCredentials(c Config, l cloudsql.Logger) (*auth.Credentials, error) {
+	detectOpts := &credentials.DetectOptions{
+		Scopes:         []string{cloudPlatformScope},
+		UniverseDomain: c.UniverseDomain,
+	}
+	switch {
+	case c.Token != "":
+		l.Infof("Impersonating service account with OAuth2 token")
+		return tokenSourceCredentials(
+			oauth2.StaticTokenSource(&oauth2.Token{AccessToken: c.Token}),
+			c.UniverseDomain,
+		), nil
+	case c.CredentialsFile != "":
+		l.Infof("Impersonating service account with the credentials file at %q", c.CredentialsFile)
+		return credentials.NewCredentialsFromFile(credentials.ServiceAccount, c.CredentialsFile, detectOpts)
+	case c.CredentialsJSON != "":
+		l.Infof("Impersonating service account with JSON credentials environment variable")
+		return credentials.NewCredentialsFromJSON(credentials.ServiceAccount, []byte(c.CredentialsJSON), detectOpts)
+	case c.GcloudAuth:
+		l.Infof("Impersonating service account with gcloud user credentials")
+		ts, err := gcloud.TokenSource()
+		if err != nil {
+			return nil, err
+		}
+		return tokenSourceCredentials(ts, c.UniverseDomain), nil
+	default:
+		l.Infof("Impersonating service account with Application Default Credentials")
+		return credentials.DetectDefault(detectOpts)
+	}
+}
+
+// tokenSourceCredentials wraps an OAuth2 token source as credentials that
+// belong to the given universe domain (googleapis.com when empty).
+func tokenSourceCredentials(ts oauth2.TokenSource, universeDomain string) *auth.Credentials {
+	if universeDomain == "" {
+		universeDomain = "googleapis.com"
+	}
+	return auth.NewCredentials(&auth.CredentialsOptions{
+		TokenProvider: oauth2adapt.TokenProviderFromTokenSource(ts),
+		UniverseDomainProvider: auth.CredentialsPropertyFunc(func(context.Context) (string, error) {
+			return universeDomain, nil
+		}),
+	})
 }
 
 // DialerOptions builds appropriate list of options from the Config
